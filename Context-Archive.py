@@ -1,0 +1,492 @@
+"""
+Context Archiver — 本地语义上下文压缩与检索
+使用 TF-IDF + Jieba 分词，纯 JSON 文件存储，零外部 API 依赖
+支持自动压缩以管理大条目集
+"""
+
+import os
+import json
+import time
+from pathlib import Path
+from typing import List, Dict, Optional
+from dataclasses import dataclass
+from datetime import datetime, timezone, timedelta
+
+try:
+    import jieba
+    import numpy as np
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+except ImportError:
+    jieba = None
+    np = None
+    TfidfVectorizer = None
+    cosine_similarity = None
+
+
+@dataclass
+class ArchiverConfig:
+    """Archiver configuration."""
+    memory_dir: str = r"E:\context-memory"
+    max_chunk_size: int = 500
+    chunk_overlap: int = 50
+    retention_days: int = 30
+    max_features: int = 1000
+    # Auto retrain interval (every N archives)
+    retrain_interval: int = 100
+
+    # ========== 压缩配置 ==========
+    max_entries_before_compress: int = 8000    # 超过此数量触发压缩
+    compress_keep_ratio: float = 0.6           # 压缩后保留的比例（如 8000 -> 4800）
+    importance_time_decay_days: int = 30       # 时间衰减周期（天）
+
+
+class ContextArchiver:
+    """Local semantic context archiver using TF-IDF + Jieba + JSON storage."""
+
+    def __init__(self, config: Optional[ArchiverConfig] = None):
+        self.config = config or ArchiverConfig()
+        self._vectorizer: Optional[TfidfVectorizer] = None
+        self._entries: List[Dict] = []
+        self._stats: Dict = {}
+        self._archive_count: int = 0
+        self._stats_file = Path(self.config.memory_dir) / "metadata.json"
+        self._entries_file = Path(self.config.memory_dir) / "entries.json"
+        self._vectorizer_file = Path(self.config.memory_dir) / "vectorizer.json"
+        self._sessions_dir = Path(self.config.memory_dir) / "sessions"
+        self._ensure_dirs()
+        self._load_state()
+
+    def _ensure_dirs(self):
+        """Create necessary directories."""
+        Path(self.config.memory_dir).mkdir(parents=True, exist_ok=True)
+        self._sessions_dir.mkdir(parents=True, exist_ok=True)
+
+    def _load_state(self):
+        """Load entries and vectorizer from disk."""
+        # Load entries
+        if self._entries_file.exists():
+            with open(self._entries_file, 'r', encoding='utf-8') as f:
+                self._entries = json.load(f)
+
+        # Load stats
+        if self._stats_file.exists():
+            with open(self._stats_file, 'r', encoding='utf-8') as f:
+                self._stats = json.load(f)
+        else:
+            self._stats = {
+                "total_entries": 0,
+                "total_chunks": 0,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "last_archive": None,
+                "last_search": None,
+                "cleanup_count": 0,
+                "retrain_count": 0,
+                "compress_count": 0,
+                "deleted_by_compress": 0,
+            }
+
+        # Build vectorizer from existing entries (or create fresh)
+        self._build_vectorizer()
+
+        # 可选：检查现有条目是否都在词汇表中，若不在则重训（初次启动时有用）
+        if len(self._entries) > 0 and getattr(self._vectorizer, 'vocabulary_', None):
+            need_retrain = False
+            for entry in self._entries:
+                text = entry.get("text", "")
+                if jieba:
+                    tokens = jieba.lcut(text)
+                else:
+                    tokens = text.split()
+                if not set(tokens).issubset(self._vectorizer.vocabulary_.keys()):
+                    need_retrain = True
+                    break
+            if need_retrain:
+                self.retrain()
+
+        self._stats["initialized"] = True
+        self._stats["total_entries"] = len(self._entries)
+        self._save_stats()
+
+        return self
+
+    def _build_vectorizer(self):
+        """Create or load vectorizer, fitting on existing entries."""
+        if TfidfVectorizer is None:
+            return
+
+        # 定义分词器（如果 jieba 可用则用 jieba，否则使用默认）
+        tokenizer_func = jieba.lcut if jieba else None
+
+        if self._vectorizer_file.exists():
+            with open(self._vectorizer_file, 'r', encoding='utf-8') as f:
+                vec_data = json.load(f)
+            self._vectorizer = TfidfVectorizer(
+                max_features=self.config.max_features,
+                tokenizer=***        # 修正：使用有效的 tokenizer
+                lowercase=False,                 # 中文无需小写
+            )
+            self._vectorizer.vocabulary_ = {k: int(v) for k, v in vec_data['vocab'].items()}
+            self._vectorizer.idf_ = np.array(vec_data['idf'])
+            self._vectorizer.fixed_vocabulary_ = True
+            print(f"Loaded vectorizer with {len(self._vectorizer.vocabulary_)} features")
+        else:
+            self._vectorizer = TfidfVectorizer(
+                max_features=self.config.max_features,
+                tokenizer=***
+                lowercase=False,
+            )
+            texts = [e["text"] for e in self._entries if e.get("text")]
+            if texts:
+                self._vectorizer.fit(texts)
+                self._vectorizer.fixed_vocabulary_ = False
+                self._save_vectorizer()
+                print(f"Initialized vectorizer with {len(self._vectorizer.vocabulary_)} features")
+            else:
+                self._vectorizer.fit(["test"])
+                print("Initialized fresh vectorizer (dummy)")
+
+    def _save_state(self):
+        """Save entries and vectorizer to disk."""
+        with open(self._entries_file, 'w', encoding='utf-8') as f:
+            json.dump(self._entries, f, ensure_ascii=False, indent=2)
+        self._save_stats()
+        self._save_vectorizer()
+
+    def _save_stats(self):
+        """Save statistics."""
+        self._stats["last_updated"] = datetime.now(timezone.utc).isoformat()
+        self._stats["total_entries"] = len(self._entries)
+        with open(self._stats_file, 'w', encoding='utf-8') as f:
+            json.dump(self._stats, f, ensure_ascii=False, indent=2)
+
+    def _save_vectorizer(self):
+        """Save vectorizer state to disk."""
+        if self._vectorizer is None:
+            return
+        if not hasattr(self._vectorizer, 'vocabulary_') or self._vectorizer.vocabulary_ is None:
+            return
+        vocab = {str(k): int(v) for k, v in self._vectorizer.vocabulary_.items()}
+        idf = [float(x) for x in self._vectorizer.idf_.tolist()]
+        with open(self._vectorizer_file, 'w', encoding='utf-8') as f:
+            json.dump({'vocab': vocab, 'idf': idf}, f, ensure_ascii=False)
+
+    def _tokenize(self, text: str) -> str:
+        """Tokenize Chinese text using Jieba (for fallback only)."""
+        if jieba:
+            words = jieba.cut(text)
+            return ' '.join([w.strip() for w in words if w.strip()])
+        return text
+
+    def archive(self, role: str, text: str, session_id: str = "default",
+                timestamp: Optional[str] = None) -> Dict:
+        """Archive a single message, splitting into chunks if necessary."""
+        if not timestamp:
+            timestamp = datetime.now(timezone.utc).isoformat()
+
+        # Split raw text into chunks
+        chunks = self._split_text(text, self.config.max_chunk_size,
+                                   self.config.chunk_overlap)
+
+        chunks_archived = 0
+        for i, chunk in enumerate(chunks):
+            vec = self._vectorizer.transform([chunk]).toarray()[0]
+
+            entry = {
+                "id": f"{session_id}_{int(time.time() * 1000)}_{i}",
+                "role": role,
+                "text": chunk,
+                "tfidf_vector": vec.tolist(),
+                "timestamp": timestamp,
+                "session_id": session_id,
+                "chunk_index": i,
+            }
+
+            self._entries.append(entry)
+            chunks_archived += 1
+            self._stats["total_chunks"] = self._stats.get("total_chunks", 0) + 1
+
+        self._archive_count += 1
+        self._stats["last_archive"] = timestamp
+
+        # ===== 仅保留周期性重训，移除实时新词检测（避免频繁重训） =====
+        if self._archive_count % self.config.retrain_interval == 0:
+            self.retrain()
+
+        self._save_state()
+
+        # ===== 自动触发压缩 =====
+        if len(self._entries) > self.config.max_entries_before_compress:
+            self.compress_context()
+
+        return {
+            "chunks_archived": chunks_archived,
+            "session_id": session_id,
+            "timestamp": timestamp,
+        }
+
+    def retrain(self):
+        """Re-train vectorizer on all current entries and update stored vectors."""
+        if self._vectorizer is None:
+            return
+        if not self._entries:
+            return
+
+        texts = [e["text"] for e in self._entries if e.get("text")]
+        self._vectorizer.fit(texts)
+        self._vectorizer.fixed_vocabulary_ = False
+
+        # Update all stored vectors to match new vocabulary
+        for entry in self._entries:
+            if entry.get("text"):
+                vec = self._vectorizer.transform([entry["text"]]).toarray()[0]
+                entry["tfidf_vector"] = vec.tolist()
+
+        self._save_vectorizer()
+        self._stats["retrain_count"] = self._stats.get("retrain_count", 0) + 1
+        print(f"Retrained: {len(self._vectorizer.vocabulary_)} features")
+
+    def _split_text(self, text: str, max_size: int, overlap: int) -> List[str]:
+        """Split text into overlapping chunks."""
+        if len(text) <= max_size:
+            return [text]
+
+        chunks = []
+        start = 0
+        while start < len(text):
+            end = start + max_size
+            chunks.append(text[start:end])
+            start = end - overlap
+
+        return chunks
+
+    def search(self, query: str, top_k: int = 5,
+               session_id: Optional[str] = None) -> List[Dict]:
+        """Search archived contexts using TF-IDF similarity."""
+        if self._vectorizer is None:
+            return []
+
+        query_vec = self._vectorizer.transform([query]).toarray()[0]
+
+        entries = self._entries
+        if session_id:
+            entries = [e for e in entries if e.get("session_id") == session_id]
+
+        scored = []
+        for entry in entries:
+            stored_vec = np.array(entry.get("tfidf_vector", []))
+            if len(stored_vec) == len(query_vec):
+                sim = cosine_similarity([query_vec], [stored_vec])[0][0]
+            else:
+                # Fallback: Jieba token overlap
+                stored_tokens = set(self._tokenize(entry.get("text", "")).split())
+                query_tokens = set(self._tokenize(query).split())
+                if stored_tokens and query_tokens:
+                    sim = len(stored_tokens & query_tokens) / max(len(stored_tokens), len(query_tokens))
+                else:
+                    sim = 0.0
+
+            scored.append({
+                "role": entry["role"],
+                "text": entry["text"],
+                "score": round(float(sim), 4),
+                "timestamp": entry["timestamp"],
+                "session_id": entry["session_id"],
+            })
+
+        scored.sort(key=lambda x: x["score"], reverse=True)
+
+        self._stats["last_search"] = datetime.now(timezone.utc).isoformat()
+        self._save_stats()
+
+        return scored[:top_k]
+
+    def fetch_relevant(self, context: str, max_tokens: int = 2000,
+                       session_id: Optional[str] = None) -> str:
+        """Fetch relevant historical context for a given conversation."""
+        results = self.search(context, top_k=10, session_id=session_id)
+
+        if not results:
+            return ""
+
+        lines = []
+        total_len = 0
+        for r in results:
+            if total_len >= max_tokens * 4:
+                break
+
+            line = f"[{r['timestamp'][:10]}] [{r['role']}] {r['text'][:200]}"
+            lines.append(line)
+            total_len += len(line)
+
+        return "\n".join(lines)
+
+    def get_status(self) -> Dict:
+        """Get archiver status and statistics."""
+        return {
+            **self._stats,
+            "memory_dir": self.config.memory_dir,
+            "initialized": self._vectorizer is not None,
+            "vectorizer_features": len(self._vectorizer.vocabulary_) if getattr(self._vectorizer, 'vocabulary_', None) else 0,
+            "total_entries": len(self._entries),
+        }
+
+    def cleanup_old_entries(self, days: Optional[int] = None) -> int:
+        """Remove entries older than specified days, then retrain."""
+        if days is None:
+            days = self.config.retention_days
+
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+        before = len(self._entries)
+        self._entries = [e for e in self._entries if e.get("timestamp", "") >= cutoff]
+        deleted = before - len(self._entries)
+
+        if deleted > 0:
+            self._stats["cleanup_count"] = self._stats.get("cleanup_count", 0) + deleted
+            self.retrain()
+
+        return deleted
+
+    def _compute_entry_importance(self, entry: Dict) -> float:
+        """
+        综合重要度 = 向量权重和（信息量） × 时间衰减因子
+        值越高，越值得保留。
+        """
+        vec = np.array(entry.get("tfidf_vector", []))
+        if len(vec) == 0:
+            return 0.0
+        info_score = float(np.sum(np.abs(vec)))
+
+        try:
+            ts_str = entry.get("timestamp", "")
+            if ts_str.endswith('Z'):
+                ts_str = ts_str[:-1] + '+00:00'
+            entry_time = datetime.fromisoformat(ts_str)
+            now = datetime.now(timezone.utc)
+            age_days = (now - entry_time).days
+        except Exception:
+            age_days = 0
+
+        decay_factor = max(0.0, 1 - age_days / self.config.importance_time_decay_days)
+        return info_score * decay_factor
+
+    def compress_context(self, max_entries: Optional[int] = None) -> int:
+        """
+        压缩上下文：根据综合重要度排序，只保留最重要的 N 条记忆。
+        返回被删除的条目数量。
+        """
+        if max_entries is None:
+            max_entries = int(self.config.max_entries_before_compress *
+                              self.config.compress_keep_ratio)
+
+        current_count = len(self._entries)
+        if current_count <= max_entries:
+            return 0
+
+        scored = []
+        for entry in self._entries:
+            score = self._compute_entry_importance(entry)
+            scored.append((score, entry))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        kept_entries = [entry for _, entry in scored[:max_entries]]
+
+        deleted = current_count - len(kept_entries)
+        self._entries = kept_entries
+
+        self._stats["last_compress"] = datetime.now(timezone.utc).isoformat()
+        self._stats["compress_count"] = self._stats.get("compress_count", 0) + 1
+        self._stats["deleted_by_compress"] = self._stats.get("deleted_by_compress", 0) + deleted
+
+        self.retrain()
+        self._save_state()
+
+        print(f"Context compressed: {deleted} entries removed, {len(self._entries)} kept.")
+        return deleted
+
+
+# Singleton instance
+_archiver: Optional[ContextArchiver] = None
+
+
+def get_archiver(config: Optional[ArchiverConfig] = None) -> ContextArchiver:
+    global _archiver
+    if _archiver is None:
+        _archiver = ContextArchiver(config)
+    return _archiver
+
+
+def init():
+    return get_archiver()
+
+
+def archive(role: str, text: str, session_id: str = "default",
+            timestamp: Optional[str] = None) -> Dict:
+    return get_archiver().archive(role, text, session_id, timestamp)
+
+
+def search(query: str, top_k: int = 5,
+           session_id: Optional[str] = None) -> List[Dict]:
+    return get_archiver().search(query, top_k, session_id)
+
+
+def fetch_relevant(context: str, max_tokens: int = 2000,
+                   session_id: Optional[str] = None) -> str:
+    return get_archiver().fetch_relevant(context, max_tokens, session_id)
+
+
+def cleanup_old_entries(days: Optional[int] = None) -> int:
+    return get_archiver().cleanup_old_entries(days)
+
+
+def retrain():
+    return get_archiver().retrain()
+
+
+def compress_context(max_entries: Optional[int] = None) -> int:
+    return get_archiver().compress_context(max_entries)
+
+
+if __name__ == "__main__":
+    import shutil
+
+    demo_dir = r"E:\context-memory-demo"
+    if os.path.exists(demo_dir):
+        shutil.rmtree(demo_dir)
+
+    print("=" * 60)
+    print("Context Archiver Demo (TF-IDF + Jieba)")
+    print("=" * 60)
+    print()
+
+    archiver = ContextArchiver(ArchiverConfig(
+        memory_dir=demo_dir,
+        retrain_interval=5,
+    ))
+
+    samples = [
+        ("user", "帮我解决agentmemory插件问题"),
+        ("assistant", "agentmemory依赖iii-worker，Windows不支持，建议安装WSL2"),
+        ("user", "怎么启动WSL2？"),
+        ("assistant", "运行 wsl --install -d Ubuntu，然后重启系统"),
+        ("user", "我有Docker Desktop，可以用Docker吗？"),
+        ("assistant", "可以！设置 AGENTMEMORY_USE_DOCKER=1 环境变量即可"),
+    ]
+
+    print("1. Archiving messages...")
+    for role, text in samples:
+        r = archiver.archive(role, text, session_id="demo")
+        print(f"   [{role}] {r['chunks_archived']} chunks")
+
+    print("\n2. Searching...")
+    results = archiver.search("agentmemory Windows", top_k=3)
+    for i, r in enumerate(results, 1):
+        print(f"   {i}. score={r['score']:.3f} [{r['role']}] {r['text'][:60]}...")
+
+    print("\n3. Status:")
+    print(json.dumps(archiver.get_status(), indent=2))
+
+    print("\n" + "=" * 60)
+    print("SUCCESS!")
+    print("=" * 60)
