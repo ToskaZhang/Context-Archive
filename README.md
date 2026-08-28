@@ -20,7 +20,7 @@ pip（Python 包管理器）
 
 1. 克隆仓库
 bash
-https://github.com/ToskaZhang/Context-Archive-
+https://github.com/ToskaZhang/Context-Archive
 cd context-archive
 2. 安装依赖
 bash
