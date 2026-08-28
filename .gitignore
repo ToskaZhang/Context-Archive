@@ -1,0 +1,17 @@
+# 日志
+*.log
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+# 虚拟环境
+venv/
+.env/
+.venv/
+# IDE
+.vscode/
+.idea/
+# 记忆数据（默认目录）
+context-memory/
+# 本地配置
+local_config.yaml
